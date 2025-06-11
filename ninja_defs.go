@@ -20,6 +20,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/google/blueprint/uniquelist"
 )
 
 // A Deps value indicates the dependency file format that Ninja should expect to
@@ -89,7 +91,8 @@ type BuildParams struct {
 	OrderOnly       []string          // The list of order-only dependencies.
 	Validations     []string          // The list of validations to run when this rule runs.
 	Args            map[string]string // The variable/value pairs to set.
-	Optional        bool              // Skip outputting a default statement
+	Default         bool              // Output a ninja default statement
+	PhonyOutput     bool              // This is a phony_output
 }
 
 // A poolDef describes a pool definition.  It does not include the name of the
@@ -261,12 +264,12 @@ type buildDef struct {
 	Implicits             []*ninjaString
 	ImplicitStrings       []string
 	OrderOnly             []*ninjaString
-	OrderOnlyStrings      []string
+	OrderOnlyStrings      uniquelist.UniqueList[string]
 	Validations           []*ninjaString
 	ValidationStrings     []string
 	Args                  map[Variable]*ninjaString
 	Variables             map[string]*ninjaString
-	Optional              bool
+	Default               bool
 }
 
 func formatTags(tags map[string]string, rule Rule) string {
@@ -333,17 +336,20 @@ func parseBuildParams(scope scope, params *BuildParams,
 		return nil, fmt.Errorf("error parsing Implicits param: %s", err)
 	}
 
-	b.OrderOnly, b.OrderOnlyStrings, err = parseNinjaOrSimpleStrings(scope, params.OrderOnly)
+	var orderOnlyStrings []string
+	b.OrderOnly, orderOnlyStrings, err = parseNinjaOrSimpleStrings(scope, params.OrderOnly)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing OrderOnly param: %s", err)
 	}
+
+	b.OrderOnlyStrings = uniquelist.Make(orderOnlyStrings)
 
 	b.Validations, b.ValidationStrings, err = parseNinjaOrSimpleStrings(scope, params.Validations)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing Validations param: %s", err)
 	}
 
-	b.Optional = params.Optional
+	b.Default = params.Default
 
 	if params.Depfile != "" {
 		value, err := parseNinjaString(scope, params.Depfile)
@@ -394,6 +400,10 @@ func parseBuildParams(scope scope, params *BuildParams,
 		}
 	}
 
+	if params.PhonyOutput {
+		setVariable("phony_output", simpleNinjaString("true"))
+	}
+
 	return b, nil
 }
 
@@ -422,7 +432,7 @@ func (b *buildDef) WriteTo(nw *ninjaWriter, nameTracker *nameTracker) error {
 
 	err := nw.Build(comment, rule, outputs, implicitOuts, explicitDeps, implicitDeps, orderOnlyDeps, validations,
 		outputStrings, implicitOutStrings, explicitDepStrings,
-		implicitDepStrings, orderOnlyDepStrings, validationStrings,
+		implicitDepStrings, orderOnlyDepStrings.ToSlice(), validationStrings,
 		nameTracker)
 	if err != nil {
 		return err
@@ -452,7 +462,7 @@ func (b *buildDef) WriteTo(nw *ninjaWriter, nameTracker *nameTracker) error {
 		}
 	}
 
-	if !b.Optional {
+	if b.Default {
 		err = nw.Default(nameTracker, outputs, outputStrings)
 		if err != nil {
 			return err

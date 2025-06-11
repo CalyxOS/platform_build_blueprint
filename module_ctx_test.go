@@ -170,6 +170,29 @@ func TestAddVariationDependencies(t *testing.T) {
 
 }
 
+func TestInvalidModuleNames(t *testing.T) {
+	t.Helper()
+	bp := `
+		test {
+			name: "fo o", // contains space
+		}
+	`
+
+	mockFS := map[string][]byte{
+		"Android.bp": []byte(bp),
+	}
+
+	ctx := NewContext()
+	ctx.RegisterModuleType("test", newModuleCtxTestModule)
+
+	ctx.MockFileSystem(mockFS)
+	_, errs := ctx.ParseFileList(".", []string{"Android.bp"}, nil)
+
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "should use a valid name") {
+		t.Errorf("Expected invalid name exception, found %s", errs)
+	}
+}
+
 func TestCheckBlueprintSyntax(t *testing.T) {
 	factories := map[string]ModuleFactory{
 		"test": newModuleCtxTestModule,
@@ -262,10 +285,6 @@ func addNinjaDepsTestBottomUpMutator(ctx BottomUpMutatorContext) {
 	ctx.AddNinjaFileDeps("BottomUpMutator")
 }
 
-func addNinjaDepsTestTopDownMutator(ctx TopDownMutatorContext) {
-	ctx.AddNinjaFileDeps("TopDownMutator")
-}
-
 type addNinjaDepsTestSingleton struct{}
 
 func addNinjaDepsTestSingletonFactory() Singleton {
@@ -288,7 +307,6 @@ func TestAddNinjaFileDeps(t *testing.T) {
 
 	ctx.RegisterModuleType("test", addNinjaDepsTestModuleFactory)
 	ctx.RegisterBottomUpMutator("testBottomUpMutator", addNinjaDepsTestBottomUpMutator)
-	ctx.RegisterTopDownMutator("testTopDownMutator", addNinjaDepsTestTopDownMutator)
 	ctx.RegisterSingletonType("testSingleton", addNinjaDepsTestSingletonFactory, false)
 	parseDeps, errs := ctx.ParseBlueprintsFiles("Android.bp", nil)
 	if len(errs) > 0 {
@@ -321,7 +339,7 @@ func TestAddNinjaFileDeps(t *testing.T) {
 		t.Errorf("ParseBlueprintsFiles: wanted deps %q, got %q", w, g)
 	}
 
-	if g, w := resolveDeps, []string{"BottomUpMutator", "TopDownMutator"}; !reflect.DeepEqual(g, w) {
+	if g, w := resolveDeps, []string{"BottomUpMutator"}; !reflect.DeepEqual(g, w) {
 		t.Errorf("ResolveDependencies: wanted deps %q, got %q", w, g)
 	}
 

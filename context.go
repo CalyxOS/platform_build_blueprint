@@ -49,6 +49,8 @@ import (
 	"github.com/google/blueprint/pathtools"
 	"github.com/google/blueprint/pool"
 	"github.com/google/blueprint/proptools"
+	"github.com/google/blueprint/syncmap"
+	"github.com/google/blueprint/uniquelist"
 )
 
 var ErrBuildActionsNotReady = errors.New("build actions are not ready")
@@ -101,9 +103,9 @@ type Context struct {
 	mutatorInfo         []*mutatorInfo
 	variantMutatorNames []string
 
-	variantCreatingMutatorOrder []string
-
-	transitionMutators []*transitionMutatorImpl
+	completedTransitionMutators int
+	transitionMutators          []*transitionMutatorImpl
+	transitionMutatorNames      []string
 
 	needsUpdateDependencies uint32 // positive if a mutator modified the dependencies
 
@@ -176,11 +178,16 @@ type Context struct {
 	// latter will depend on the flag above.
 	incrementalEnabled bool
 
-	buildActionsToCache       BuildActionCache
-	buildActionsToCacheLock   sync.Mutex
-	buildActionsFromCache     BuildActionCache
-	orderOnlyStringsFromCache OrderOnlyStringsCache
-	orderOnlyStringsToCache   OrderOnlyStringsCache
+	buildActionsCache       BuildActionCache
+	buildActionsToCacheLock sync.Mutex
+	orderOnlyStringsCache   OrderOnlyStringsCache
+	orderOnlyStrings        syncmap.SyncMap[uniquelist.UniqueList[string], *orderOnlyStringsInfo]
+}
+
+type orderOnlyStringsInfo struct {
+	dedup       bool
+	incremental bool
+	dedupName   string
 }
 
 // A container for String keys. The keys can be used to gate build graph traversal
@@ -360,12 +367,25 @@ type moduleInfo struct {
 	obsoletedByNewVariants bool
 
 	// Used by TransitionMutator implementations
-	transitionVariations     []string
-	currentTransitionMutator string
-	requiredVariationsLock   sync.Mutex
+
+	// incomingTransitionInfos stores the map from variation to TransitionInfo object for transitions that were
+	// requested by reverse dependencies.  It is updated by reverse dependencies and protected by
+	// incomingTransitionInfosLock.  It is invalid after the TransitionMutator top down mutator has run on
+	// this module.
+	incomingTransitionInfos     map[string]TransitionInfo
+	incomingTransitionInfosLock sync.Mutex
+	// splitTransitionInfos and splitTransitionVariations stores the list of TransitionInfo objects, and their
+	// corresponding variations, returned by Split or requested by reverse dependencies.  They are valid after the
+	// TransitionMutator top down mutator has run on this module, and invalid after the bottom up mutator has run.
+	splitTransitionInfos      []TransitionInfo
+	splitTransitionVariations []string
+	currentTransitionMutator  string
+
+	// transitionInfos stores the final TransitionInfo for this module indexed by transitionMutatorImpl.index
+	transitionInfos []TransitionInfo
 
 	// outgoingTransitionCache stores the final variation for each dependency, indexed by the source variation
-	// index in transitionVariations and then by the index of the dependency in directDeps
+	// index in splitTransitionInfos and then by the index of the dependency in directDeps
 	outgoingTransitionCache [][]string
 
 	// set during PrepareBuildActions
@@ -433,9 +453,24 @@ func (module *moduleInfo) ModuleCacheKey() string {
 	if variant == "" {
 		variant = "none"
 	}
-	return fmt.Sprintf("%s-%s-%s-%s",
-		strings.ReplaceAll(filepath.Dir(module.relBlueprintsFile), "/", "."),
-		module.Name(), variant, module.typeName)
+	return calculateFileNameHash(fmt.Sprintf("%s-%s-%s-%s",
+		filepath.Dir(module.relBlueprintsFile), module.Name(), variant, module.typeName))
+
+}
+
+func calculateFileNameHash(name string) string {
+	hash, err := proptools.CalculateHash(name)
+	if err != nil {
+		panic(newPanicErrorf(err, "failed to calculate hash for file name: %s", name))
+	}
+	return strconv.FormatUint(hash, 16)
+}
+
+func (c *Context) setModuleTransitionInfo(module *moduleInfo, t *transitionMutatorImpl, info TransitionInfo) {
+	if len(module.transitionInfos) == 0 {
+		module.transitionInfos = make([]TransitionInfo, len(c.transitionMutators))
+	}
+	module.transitionInfos[t.index] = info
 }
 
 // A Variation is a way that a variant of a module differs from other variants of the same module.
@@ -537,11 +572,11 @@ type singletonInfo struct {
 
 type mutatorInfo struct {
 	// set during RegisterMutator
-	topDownMutator    TopDownMutator
-	bottomUpMutator   BottomUpMutator
-	name              string
-	index             int
-	transitionMutator *transitionMutatorImpl
+	transitionPropagateMutator func(BaseModuleContext)
+	bottomUpMutator            BottomUpMutator
+	name                       string
+	index                      int
+	transitionMutator          *transitionMutatorImpl
 
 	usesRename              bool
 	usesReverseDependencies bool
@@ -549,27 +584,27 @@ type mutatorInfo struct {
 	usesCreateModule        bool
 	mutatesDependencies     bool
 	mutatesGlobalState      bool
-	neverFar                bool
 }
 
 func newContext() *Context {
 	eventHandler := metrics.EventHandler{}
 	return &Context{
-		Context:                 context.Background(),
-		EventHandler:            &eventHandler,
-		moduleFactories:         make(map[string]ModuleFactory),
-		nameInterface:           NewSimpleNameInterface(),
-		moduleInfo:              make(map[Module]*moduleInfo),
-		globs:                   make(map[globKey]pathtools.GlobResult),
-		fs:                      pathtools.OsFs,
-		includeTags:             &IncludeTags{},
-		sourceRootDirs:          &SourceRootDirs{},
-		outDir:                  nil,
-		requiredNinjaMajor:      1,
-		requiredNinjaMinor:      7,
-		requiredNinjaMicro:      0,
-		buildActionsToCache:     make(BuildActionCache),
-		orderOnlyStringsToCache: make(OrderOnlyStringsCache),
+		Context:               context.Background(),
+		EventHandler:          &eventHandler,
+		moduleFactories:       make(map[string]ModuleFactory),
+		nameInterface:         NewSimpleNameInterface(),
+		moduleInfo:            make(map[Module]*moduleInfo),
+		globs:                 make(map[globKey]pathtools.GlobResult),
+		fs:                    pathtools.OsFs,
+		includeTags:           &IncludeTags{},
+		sourceRootDirs:        &SourceRootDirs{},
+		outDir:                nil,
+		requiredNinjaMajor:    1,
+		requiredNinjaMinor:    7,
+		requiredNinjaMicro:    0,
+		buildActionsCache:     make(BuildActionCache),
+		orderOnlyStringsCache: make(OrderOnlyStringsCache),
+		orderOnlyStrings:      syncmap.SyncMap[uniquelist.UniqueList[string], *orderOnlyStringsInfo]{},
 	}
 }
 
@@ -712,20 +747,20 @@ func (c *Context) updateBuildActionsCache(key *BuildActionCacheKey, data *BuildA
 	if key != nil {
 		c.buildActionsToCacheLock.Lock()
 		defer c.buildActionsToCacheLock.Unlock()
-		c.buildActionsToCache[*key] = data
+		c.buildActionsCache[*key] = data
 	}
 }
 
 func (c *Context) getBuildActionsFromCache(key *BuildActionCacheKey) *BuildActionCachedData {
-	if c.buildActionsFromCache != nil && key != nil {
-		return c.buildActionsFromCache[*key]
+	if c.buildActionsCache != nil && key != nil {
+		return c.buildActionsCache[*key]
 	}
 	return nil
 }
 
 func (c *Context) CacheAllBuildActions(soongOutDir string) error {
-	return errors.Join(writeToCache(c, soongOutDir, BuildActionsCacheFile, &c.buildActionsToCache),
-		writeToCache(c, soongOutDir, OrderOnlyStringsCacheFile, &c.orderOnlyStringsToCache))
+	return errors.Join(writeToCache(c, soongOutDir, BuildActionsCacheFile, &c.buildActionsCache),
+		writeToCache(c, soongOutDir, OrderOnlyStringsCacheFile, &c.orderOnlyStringsCache))
 }
 
 func writeToCache[T any](ctx *Context, soongOutDir string, fileName string, data *T) error {
@@ -741,10 +776,8 @@ func writeToCache[T any](ctx *Context, soongOutDir string, fileName string, data
 }
 
 func (c *Context) RestoreAllBuildActions(soongOutDir string) error {
-	c.buildActionsFromCache = make(BuildActionCache)
-	c.orderOnlyStringsFromCache = make(OrderOnlyStringsCache)
-	return errors.Join(restoreFromCache(c, soongOutDir, BuildActionsCacheFile, &c.buildActionsFromCache),
-		restoreFromCache(c, soongOutDir, OrderOnlyStringsCacheFile, &c.orderOnlyStringsFromCache))
+	return errors.Join(restoreFromCache(c, soongOutDir, BuildActionsCacheFile, &c.buildActionsCache),
+		restoreFromCache(c, soongOutDir, OrderOnlyStringsCacheFile, &c.orderOnlyStringsCache))
 }
 
 func restoreFromCache[T any](ctx *Context, soongOutDir string, fileName string, data *T) error {
@@ -786,27 +819,20 @@ func singletonTypeName(singleton Singleton) string {
 	return typ.PkgPath() + "." + typ.Name()
 }
 
-// RegisterTopDownMutator registers a mutator that will be invoked to propagate dependency info
-// top-down between Modules.  Each registered mutator is invoked in registration order (mixing
-// TopDownMutators and BottomUpMutators) once per Module, and the invocation on any module will
-// have returned before it is in invoked on any of its dependencies.
-//
-// The mutator type names given here must be unique to all top down mutators in
-// the Context.
-//
-// Returns a MutatorHandle, on which Parallel can be called to set the mutator to visit modules in
-// parallel while maintaining ordering.
-func (c *Context) RegisterTopDownMutator(name string, mutator TopDownMutator) MutatorHandle {
+// registerTransitionPropagateMutator registers a mutator that will be invoked to propagate transition mutator
+// configuration info top-down between Modules.
+func (c *Context) registerTransitionPropagateMutator(name string, mutator func(mctx BaseModuleContext)) MutatorHandle {
 	for _, m := range c.mutatorInfo {
-		if m.name == name && m.topDownMutator != nil {
+		if m.name == name && m.transitionPropagateMutator != nil {
 			panic(fmt.Errorf("mutator %q is already registered", name))
 		}
 	}
 
 	info := &mutatorInfo{
-		topDownMutator: mutator,
-		name:           name,
-		index:          len(c.mutatorInfo),
+		transitionPropagateMutator: mutator,
+
+		name:  name,
+		index: len(c.mutatorInfo),
 	}
 
 	c.mutatorInfo = append(c.mutatorInfo, info)
@@ -815,15 +841,11 @@ func (c *Context) RegisterTopDownMutator(name string, mutator TopDownMutator) Mu
 }
 
 // RegisterBottomUpMutator registers a mutator that will be invoked to split Modules into variants.
-// Each registered mutator is invoked in registration order (mixing TopDownMutators and
-// BottomUpMutators) once per Module, will not be invoked on a module until the invocations on all
-// of the modules dependencies have returned.
+// Each registered mutator is invoked in registration order once per Module, and will not be invoked on a
+// module until the invocations on all of the modules dependencies have returned.
 //
 // The mutator type names given here must be unique to all bottom up or early
 // mutators in the Context.
-//
-// Returns a MutatorHandle, on which Parallel can be called to set the mutator to visit modules in
-// parallel while maintaining ordering.
 func (c *Context) RegisterBottomUpMutator(name string, mutator BottomUpMutator) MutatorHandle {
 	for _, m := range c.variantMutatorNames {
 		if m == name {
@@ -880,7 +902,6 @@ type MutatorHandle interface {
 	MutatesGlobalState() MutatorHandle
 
 	setTransitionMutator(impl *transitionMutatorImpl) MutatorHandle
-	setNeverFar() MutatorHandle
 }
 
 func (mutator *mutatorInfo) UsesRename() MutatorHandle {
@@ -915,11 +936,6 @@ func (mutator *mutatorInfo) MutatesGlobalState() MutatorHandle {
 
 func (mutator *mutatorInfo) setTransitionMutator(impl *transitionMutatorImpl) MutatorHandle {
 	mutator.transitionMutator = impl
-	return mutator
-}
-
-func (mutator *mutatorInfo) setNeverFar() MutatorHandle {
-	mutator.neverFar = true
 	return mutator
 }
 
@@ -1667,6 +1683,7 @@ func (c *Context) createVariations(origModule *moduleInfo, mutator *mutatorInfo,
 		newModule.properties = newProperties
 		newModule.providers = slices.Clone(origModule.providers)
 		newModule.providerInitialValueHashes = slices.Clone(origModule.providerInitialValueHashes)
+		newModule.transitionInfos = slices.Clone(origModule.transitionInfos)
 
 		newModules = append(newModules, newModule)
 
@@ -1711,20 +1728,6 @@ func chooseDepByIndexes(mutatorName string, variations [][]string) depChooser {
 	return func(source *moduleInfo, variationIndex, depIndex int, dep depInfo) (*moduleInfo, string) {
 		desiredVariation := variations[variationIndex][depIndex]
 		return chooseDep(dep.module.splitModules, mutatorName, desiredVariation, nil)
-	}
-}
-
-func chooseDepExplicit(mutatorName string,
-	variationName string, defaultVariationName *string) depChooser {
-	return func(source *moduleInfo, variationIndex, depIndex int, dep depInfo) (*moduleInfo, string) {
-		return chooseDep(dep.module.splitModules, mutatorName, variationName, defaultVariationName)
-	}
-}
-
-func chooseDepInherit(mutatorName string, defaultVariationName *string) depChooser {
-	return func(source *moduleInfo, variationIndex, depIndex int, dep depInfo) (*moduleInfo, string) {
-		sourceVariation := source.variant.variations.get(mutatorName)
-		return chooseDep(dep.module.splitModules, mutatorName, sourceVariation, defaultVariationName)
 	}
 }
 
@@ -1961,65 +1964,33 @@ func blueprintDepsMutator(ctx BottomUpMutatorContext) {
 	}
 }
 
-func (c *Context) findReverseDependency(module *moduleInfo, config any, requestedVariations []Variation, destName string) (*moduleInfo, []error) {
-	if destName == module.Name() {
-		return nil, []error{&BlueprintError{
-			Err: fmt.Errorf("%q depends on itself", destName),
-			Pos: module.pos,
-		}}
-	}
-
-	possibleDeps := c.moduleGroupFromName(destName, module.namespace())
-	if possibleDeps == nil {
-		return nil, []error{&BlueprintError{
-			Err: fmt.Errorf("%q has a reverse dependency on undefined module %q",
-				module.Name(), destName),
-			Pos: module.pos,
-		}}
-	}
-
-	if m, _, errs := c.findVariant(module, config, possibleDeps, requestedVariations, false, true); errs != nil {
-		return nil, errs
-	} else if m != nil {
-		return m, nil
-	}
-
-	if c.allowMissingDependencies {
-		// Allow missing variants.
-		return nil, c.discoveredMissingDependencies(module, destName, module.variant.variations)
-	}
-
-	return nil, []error{&BlueprintError{
-		Err: fmt.Errorf("reverse dependency %q of %q missing variant:\n  %s\navailable variants:\n  %s",
-			destName, module.Name(),
-			c.prettyPrintVariant(module.variant.variations),
-			c.prettyPrintGroupVariants(possibleDeps)),
-		Pos: module.pos,
-	}}
-}
-
 // applyTransitions takes a variationMap being used to add a dependency on a module in a moduleGroup
 // and applies the OutgoingTransition and IncomingTransition methods of each completed TransitionMutator to
 // modify the requested variation.  It finds a variant that existed before the TransitionMutator ran that is
 // a subset of the requested variant to use as the module context for IncomingTransition.
 func (c *Context) applyTransitions(config any, module *moduleInfo, group *moduleGroup, variant variationMap,
-	requestedVariations []Variation) (variationMap, []error) {
-	for _, transitionMutator := range c.transitionMutators {
+	requestedVariations []Variation, far bool) (variationMap, []error) {
+	for _, transitionMutator := range c.transitionMutators[:c.completedTransitionMutators] {
 		explicitlyRequested := slices.ContainsFunc(requestedVariations, func(variation Variation) bool {
 			return variation.Mutator == transitionMutator.name
 		})
 
-		sourceVariation := variant.get(transitionMutator.name)
-		outgoingVariation := sourceVariation
-
-		// Apply the outgoing transition if it was not explicitly requested.
-		if !explicitlyRequested {
+		var outgoingTransitionInfo TransitionInfo
+		if explicitlyRequested {
+			sourceVariation := variant.get(transitionMutator.name)
+			outgoingTransitionInfo = transitionMutator.mutator.TransitionInfoFromVariation(sourceVariation)
+		} else {
+			// Apply the outgoing transition if it was not explicitly requested.
+			var srcTransitionInfo TransitionInfo
+			if (!far || transitionMutator.neverFar) && len(module.transitionInfos) > transitionMutator.index {
+				srcTransitionInfo = module.transitionInfos[transitionMutator.index]
+			}
 			ctx := outgoingTransitionContextPool.Get()
 			*ctx = outgoingTransitionContextImpl{
 				transitionContextImpl{context: c, source: module, dep: nil,
 					depTag: nil, postMutator: true, config: config},
 			}
-			outgoingVariation = transitionMutator.mutator.OutgoingTransition(ctx, sourceVariation)
+			outgoingTransitionInfo = transitionMutator.mutator.OutgoingTransition(ctx, srcTransitionInfo)
 			errs := ctx.errs
 			outgoingTransitionContextPool.Put(ctx)
 			ctx = nil
@@ -2028,7 +1999,7 @@ func (c *Context) applyTransitions(config any, module *moduleInfo, group *module
 			}
 		}
 
-		earlierVariantCreatingMutators := c.variantCreatingMutatorOrder[:transitionMutator.variantCreatingMutatorIndex]
+		earlierVariantCreatingMutators := c.transitionMutatorNames[:transitionMutator.index]
 		filteredVariant := variant.cloneMatching(earlierVariantCreatingMutators)
 
 		check := func(inputVariant variationMap) bool {
@@ -2067,14 +2038,18 @@ func (c *Context) applyTransitions(config any, module *moduleInfo, group *module
 					depTag: nil, postMutator: true, config: config},
 			}
 
-			finalVariation := transitionMutator.mutator.IncomingTransition(ctx, outgoingVariation)
+			finalTransitionInfo := transitionMutator.mutator.IncomingTransition(ctx, outgoingTransitionInfo)
 			errs := ctx.errs
 			incomingTransitionContextPool.Put(ctx)
 			ctx = nil
 			if len(errs) > 0 {
 				return variationMap{}, errs
 			}
-			variant.set(transitionMutator.name, finalVariation)
+			variation := ""
+			if finalTransitionInfo != nil {
+				variation = finalTransitionInfo.Variation()
+			}
+			variant.set(transitionMutator.name, variation)
 		}
 
 		if (matchingInputVariant == nil && !explicitlyRequested) || variant.get(transitionMutator.name) == "" {
@@ -2097,9 +2072,9 @@ func (c *Context) findVariant(module *moduleInfo, config any,
 	if !far {
 		newVariant = module.variant.variations.clone()
 	} else {
-		for _, mutator := range c.mutatorInfo {
-			if mutator.neverFar {
-				newVariant.set(mutator.name, module.variant.variations.get(mutator.name))
+		for _, transitionMutator := range c.transitionMutators {
+			if transitionMutator.neverFar {
+				newVariant.set(transitionMutator.name, module.variant.variations.get(transitionMutator.name))
 			}
 		}
 	}
@@ -2109,7 +2084,7 @@ func (c *Context) findVariant(module *moduleInfo, config any,
 
 	if !reverse {
 		var errs []error
-		newVariant, errs = c.applyTransitions(config, module, possibleDeps, newVariant, requestedVariations)
+		newVariant, errs = c.applyTransitions(config, module, possibleDeps, newVariant, requestedVariations, far)
 		if len(errs) > 0 {
 			return nil, variationMap{}, errs
 		}
@@ -2922,7 +2897,7 @@ func (c *Context) runMutators(ctx context.Context, config interface{}, mutatorGr
 				c.BeginEvent(name)
 				defer c.EndEvent(name)
 				var newDeps []string
-				if mutatorGroup[0].topDownMutator != nil {
+				if mutatorGroup[0].transitionPropagateMutator != nil {
 					newDeps, errs = c.runMutator(config, mutatorGroup, topDownMutator)
 				} else if mutatorGroup[0].bottomUpMutator != nil {
 					newDeps, errs = c.runMutator(config, mutatorGroup, bottomUpMutator)
@@ -2978,7 +2953,7 @@ func (topDownMutatorImpl) run(mutatorGroup []*mutatorInfo, ctx *mutatorContext) 
 	if len(mutatorGroup) > 1 {
 		panic(fmt.Errorf("top down mutator group %s must only have 1 mutator, found %d", mutatorGroup[0].name, len(mutatorGroup)))
 	}
-	mutatorGroup[0].topDownMutator(ctx)
+	mutatorGroup[0].transitionPropagateMutator(ctx)
 }
 
 func (topDownMutatorImpl) orderer() visitOrderer {
@@ -3093,7 +3068,6 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 		return hasErrors
 	}
 
-	createdVariations := false
 	var obsoleteLogicModules []Module
 
 	// Process errs and reverseDeps in a single goroutine
@@ -3117,7 +3091,6 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 				for _, module := range newVariations.newVariations {
 					newModuleInfo[module.logicModule] = module
 				}
-				createdVariations = true
 			case <-done:
 				return
 			}
@@ -3146,10 +3119,10 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 
 	c.moduleInfo = newModuleInfo
 
-	isTransitionMutator := mutatorGroup[0].transitionMutator != nil
+	transitionMutator := mutatorGroup[0].transitionMutator
 
 	var transitionMutatorInputVariants map[*moduleGroup][]*moduleInfo
-	if isTransitionMutator {
+	if transitionMutator != nil {
 		transitionMutatorInputVariants = make(map[*moduleGroup][]*moduleInfo)
 	}
 
@@ -3159,7 +3132,7 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 
 			// Update module group to contain newly split variants
 			if module.splitModules != nil {
-				if isTransitionMutator {
+				if transitionMutator != nil {
 					// For transition mutators, save the pre-split variant for reusing later in applyTransitions.
 					transitionMutatorInputVariants[group] = append(transitionMutatorInputVariants[group], module)
 				}
@@ -3187,14 +3160,9 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 		}
 	}
 
-	if isTransitionMutator {
-		mutatorGroup[0].transitionMutator.inputVariants = transitionMutatorInputVariants
-		mutatorGroup[0].transitionMutator.variantCreatingMutatorIndex = len(c.variantCreatingMutatorOrder)
-		c.transitionMutators = append(c.transitionMutators, mutatorGroup[0].transitionMutator)
-	}
-
-	if createdVariations {
-		c.variantCreatingMutatorOrder = append(c.variantCreatingMutatorOrder, mutatorGroup[0].name)
+	if transitionMutator != nil {
+		transitionMutator.inputVariants = transitionMutatorInputVariants
+		c.completedTransitionMutators = transitionMutator.index + 1
 	}
 
 	// Add in any new reverse dependencies that were added by the mutator
@@ -3363,12 +3331,8 @@ func (c *Context) generateModuleBuildActions(config interface{},
 						}
 					}
 				}()
-				restored, cacheKey := mctx.restoreModuleBuildActions()
-				if !restored {
+				if !mctx.restoreModuleBuildActions() {
 					mctx.module.logicModule.GenerateBuildActions(mctx)
-				}
-				if cacheKey != nil {
-					mctx.cacheModuleBuildActions(cacheKey)
 				}
 			}()
 
@@ -4587,23 +4551,20 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 	c.BeginEvent("modules")
 	defer c.EndEvent("modules")
 
-	modules := make([]*moduleInfo, 0, len(c.moduleInfo))
-	incrementalModules := make([]*moduleInfo, 0, 200)
+	var modules []*moduleInfo
+	var incModules []*moduleInfo
 
 	for _, module := range c.moduleInfo {
 		if module.buildActionCacheKey != nil {
-			incrementalModules = append(incrementalModules, module)
+			incModules = append(incModules, module)
 			continue
 		}
 		modules = append(modules, module)
 	}
 	sort.Sort(moduleSorter{modules, c.nameInterface})
-	sort.Sort(moduleSorter{incrementalModules, c.nameInterface})
+	sort.Sort(moduleSorter{incModules, c.nameInterface})
 
-	phonys := c.deduplicateOrderOnlyDeps(append(modules, incrementalModules...))
-	if err := orderOnlyForIncremental(c, incrementalModules, phonys); err != nil {
-		return err
-	}
+	phonys := c.deduplicateOrderOnlyDeps(append(modules, incModules...))
 
 	c.EventHandler.Do("sort_phony_builddefs", func() {
 		// sorting for determinism, the phony output names are stable
@@ -4666,7 +4627,7 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				err := writeIncrementalModules(c, file, incrementalModules, headerTemplate)
+				err := writeIncrementalModules(c, file, incModules, headerTemplate)
 				if err != nil {
 					errorCh <- err
 				}
@@ -4692,70 +4653,6 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 	}
 }
 
-func orderOnlyForIncremental(c *Context, modules []*moduleInfo, phonys *localBuildActions) error {
-	for _, mod := range modules {
-		// find the order only strings of the incremental module, it can come from
-		// the cache or from buildDefs depending on if the module was skipped or not.
-		var orderOnlyStrings []string
-		if mod.incrementalRestored {
-			orderOnlyStrings = mod.orderOnlyStrings
-		} else {
-			for _, b := range mod.actionDefs.buildDefs {
-				// We do similar check when creating phonys in deduplicateOrderOnlyDeps as well
-				if len(b.OrderOnly) > 0 {
-					return fmt.Errorf("order only shouldn't be used: %s", mod.Name())
-				}
-				for _, str := range b.OrderOnlyStrings {
-					if strings.HasPrefix(str, "dedup-") {
-						orderOnlyStrings = append(orderOnlyStrings, str)
-					}
-				}
-			}
-		}
-
-		if len(orderOnlyStrings) == 0 {
-			continue
-		}
-
-		// update the order only string cache with the info found above.
-		if data, ok := c.buildActionsToCache[*mod.buildActionCacheKey]; ok {
-			data.OrderOnlyStrings = orderOnlyStrings
-		}
-
-		if !mod.incrementalRestored {
-			continue
-		}
-
-		// if the module is skipped, the order only string that we restored from the
-		// cache might not exist anymore. For example, if two modules shared the same
-		// set of order only strings initially, deduplicateOrderOnlyDeps would create
-		// a dedup-* phony and replace the order only string with this phony for these
-		// two modules. If one of the module had its order only strings changed, and
-		// we skip the other module in the next build, the dedup-* phony would not
-		// in the phony list anymore, so we need to add it here in order to avoid
-		// writing the ninja statements for the skipped module, otherwise it would
-		// reference a dedup-* phony that no longer exists.
-		for _, dep := range orderOnlyStrings {
-			// nothing changed to this phony, the cached value is still valid
-			if _, ok := c.orderOnlyStringsToCache[dep]; ok {
-				continue
-			}
-			orderOnlyStrings, ok := c.orderOnlyStringsFromCache[dep]
-			if !ok {
-				return fmt.Errorf("no cached value found for order only dep: %s", dep)
-			}
-			phony := buildDef{
-				Rule:          Phony,
-				OutputStrings: []string{dep},
-				InputStrings:  orderOnlyStrings,
-				Optional:      true,
-			}
-			phonys.buildDefs = append(phonys.buildDefs, &phony)
-			c.orderOnlyStringsToCache[dep] = orderOnlyStrings
-		}
-	}
-	return nil
-}
 func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo, headerTemplate *template.Template) error {
 	bf, err := c.fs.OpenFile(JoinPath(c.SrcDir(), baseFile), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, OutFilePermissions)
 	if err != nil {
@@ -4770,6 +4667,8 @@ func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo,
 	if err != nil {
 		return err
 	}
+
+	c.buildActionsCache = make(BuildActionCache)
 	for _, module := range modules {
 		moduleFile := filepath.Join(ninjaPath, module.ModuleCacheKey()+".ninja")
 		if !module.incrementalRestored {
@@ -4787,6 +4686,9 @@ func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo,
 			if err != nil {
 				return err
 			}
+		}
+		if module.buildActionCacheKey != nil {
+			c.cacheModuleBuildActions(module)
 		}
 		bWriter.Subninja(moduleFile)
 	}
@@ -4915,16 +4817,6 @@ func (c *Context) SetBeforePrepareBuildActionsHook(hookFn func() error) {
 	c.BeforePrepareBuildActionsHook = hookFn
 }
 
-// phonyCandidate represents the state of a set of deps that decides its eligibility
-// to be extracted as a phony output
-type phonyCandidate struct {
-	sync.Once
-	phony             *buildDef // the phony buildDef that wraps the set
-	first             *buildDef // the first buildDef that uses this set
-	orderOnlyStrings  []string  // the original OrderOnlyStrings of the first buildDef that uses this set
-	usedByIncremental bool      // if the phony is used by any incremental module
-}
-
 // keyForPhonyCandidate gives a unique identifier for a set of deps.
 func keyForPhonyCandidate(stringDeps []string) uint64 {
 	hasher := fnv.New64a()
@@ -4942,42 +4834,6 @@ func keyForPhonyCandidate(stringDeps []string) uint64 {
 	return hasher.Sum64()
 }
 
-// scanBuildDef is called for every known buildDef `b` that has a non-empty `b.OrderOnly`.
-// If `b.OrderOnly` is not present in `candidates`, it gets stored.
-// But if `b.OrderOnly` already exists in `candidates`, then `b.OrderOnly`
-// (and phonyCandidate#first.OrderOnly) will be replaced with phonyCandidate#phony.Outputs
-func scanBuildDef(candidates *sync.Map, b *buildDef, incremental bool) {
-	key := keyForPhonyCandidate(b.OrderOnlyStrings)
-	if v, loaded := candidates.LoadOrStore(key, &phonyCandidate{
-		first:             b,
-		orderOnlyStrings:  b.OrderOnlyStrings,
-		usedByIncremental: incremental,
-	}); loaded {
-		m := v.(*phonyCandidate)
-		if slices.Equal(m.orderOnlyStrings, b.OrderOnlyStrings) {
-			m.Do(func() {
-				// this is the second occurrence and hence it makes sense to
-				// extract it as a phony output
-				m.phony = &buildDef{
-					Rule:          Phony,
-					OutputStrings: []string{fmt.Sprintf("dedup-%x", key)},
-					InputStrings:  m.first.OrderOnlyStrings,
-					Optional:      true,
-				}
-				// the previously recorded build-def, which first had these deps as its
-				// order-only deps, should now use this phony output instead
-				m.first.OrderOnlyStrings = m.phony.OutputStrings
-				m.first = nil
-			})
-			b.OrderOnlyStrings = m.phony.OutputStrings
-			// don't override the value with false if it was set to true already
-			if incremental {
-				m.usedByIncremental = incremental
-			}
-		}
-	}
-}
-
 // deduplicateOrderOnlyDeps searches for common sets of order-only dependencies across all
 // buildDef instances in the provided moduleInfo instances. Each such
 // common set forms a new buildDef representing a phony output that then becomes
@@ -4986,34 +4842,64 @@ func (c *Context) deduplicateOrderOnlyDeps(modules []*moduleInfo) *localBuildAct
 	c.BeginEvent("deduplicate_order_only_deps")
 	defer c.EndEvent("deduplicate_order_only_deps")
 
-	candidates := sync.Map{} //used as map[key]*candidate
-	parallelVisit(slices.Values(modules), unorderedVisitorImpl{}, parallelVisitLimit,
-		func(m *moduleInfo, pause chan<- pauseSpec) bool {
-			incremental := m.buildActionCacheKey != nil
-			for _, b := range m.actionDefs.buildDefs {
-				// The dedup logic doesn't handle the case where OrderOnly is not empty
-				if len(b.OrderOnly) == 0 && len(b.OrderOnlyStrings) > 0 {
-					scanBuildDef(&candidates, b, incremental)
-				}
-			}
-			return false
-		})
-
-	// now collect all created phonys to return
 	var phonys []*buildDef
-	candidates.Range(func(_ any, v any) bool {
-		candidate := v.(*phonyCandidate)
-		if candidate.phony != nil {
-			phonys = append(phonys, candidate.phony)
-			if candidate.usedByIncremental {
-				c.orderOnlyStringsToCache[candidate.phony.OutputStrings[0]] =
-					candidate.phony.InputStrings
+	c.orderOnlyStringsCache = make(OrderOnlyStringsCache)
+	c.orderOnlyStrings.Range(func(key uniquelist.UniqueList[string], info *orderOnlyStringsInfo) bool {
+		if info.dedup {
+			dedup := fmt.Sprintf("dedup-%x", keyForPhonyCandidate(key.ToSlice()))
+			phony := &buildDef{
+				Rule:          Phony,
+				OutputStrings: []string{dedup},
+				InputStrings:  key.ToSlice(),
+			}
+			info.dedupName = dedup
+			phonys = append(phonys, phony)
+			if info.incremental {
+				c.orderOnlyStringsCache[phony.OutputStrings[0]] = phony.InputStrings
 			}
 		}
 		return true
 	})
 
+	parallelVisit(slices.Values(modules), unorderedVisitorImpl{}, parallelVisitLimit,
+		func(m *moduleInfo, pause chan<- pauseSpec) bool {
+			for _, def := range m.actionDefs.buildDefs {
+				if info, loaded := c.orderOnlyStrings.Load(def.OrderOnlyStrings); loaded {
+					if info.dedup {
+						def.OrderOnlyStrings = uniquelist.Make([]string{info.dedupName})
+						m.orderOnlyStrings = append(m.orderOnlyStrings, info.dedupName)
+					}
+				}
+			}
+			return false
+		})
+
 	return &localBuildActions{buildDefs: phonys}
+}
+
+func (c *Context) cacheModuleBuildActions(module *moduleInfo) {
+	var providers []CachedProvider
+	for i, p := range module.providers {
+		if p != nil && providerRegistry[i].mutator == "" {
+			providers = append(providers,
+				CachedProvider{
+					Id:    providerRegistry[i],
+					Value: &p,
+				})
+		}
+	}
+
+	// These show up in the ninja file, so we need to cache these to ensure we
+	// re-generate ninja file if they changed.
+	relPos := module.pos
+	relPos.Filename = module.relBlueprintsFile
+	data := BuildActionCachedData{
+		Providers:        providers,
+		Pos:              &relPos,
+		OrderOnlyStrings: module.orderOnlyStrings,
+	}
+
+	c.updateBuildActionsCache(module.buildActionCacheKey, &data)
 }
 
 func (c *Context) writeLocalBuildActions(nw *ninjaWriter,
